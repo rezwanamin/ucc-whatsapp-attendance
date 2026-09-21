@@ -1,12 +1,11 @@
-# UCC WhatsApp Attendance V4
+# UCC WhatsApp Attendance V5
 
-Diagnostic version.
+Adds browser diagnostics for incoming WhatsApp group messages.
 
-## Routes
-- `/health` — service health
-- `/status` — WhatsApp/group status
-- `/debug` — diagnostic configuration/status
-- `/qr?token=YOUR_QR_TOKEN` — secure QR page
-- `/test-google?token=YOUR_QR_TOKEN` — sends one TEST USER attendance event to Google Apps Script
-
-Do not commit `.env` or `auth_info`.
+Routes:
+- `/health`
+- `/status`
+- `/debug`
+- `/messages?token=YOUR_QR_TOKEN` — last 30 incoming group-message events
+- `/qr?token=YOUR_QR_TOKEN`
+- `/test-google?token=YOUR_QR_TOKEN`
