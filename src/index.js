@@ -93,13 +93,14 @@ function extractMessageText(message) {
 }
 
 function parseAttendance(text) {
-  const t = normalizeText(text);
+  // Remove harmless trailing punctuation often added in WhatsApp messages.
+  const t = normalizeText(text).replace(/[.!?。]+$/u, '').trim();
 
   // Accepted examples:
   // Maidul Entry Time 6.00am
   // Maidul Entry 6:00 AM
-  // Maidul Left time 6.00pm
-  // Maidul LEFT 6:00 PM
+  // Maidul Left time 6.00pm.
+  // Maidul LEFT 6:00 PM!
   const m = t.match(
     /^(.+?)\s+(entry(?:\s*time)?|left(?:\s*time)?)\s*[:\-]?\s*(\d{1,2})[.:](\d{2})\s*(am|pm)$/i
   );
