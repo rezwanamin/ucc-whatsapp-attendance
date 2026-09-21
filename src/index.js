@@ -89,6 +89,28 @@ async function postAttendance(event) {
   logger.info({ response: body }, 'Attendance sent to Google Sheets');
 }
 
+
+async function sendTestAttendance() {
+  const now = new Date();
+  const testEvent = {
+    event: 'attendance',
+    groupName: GROUP_NAME,
+    groupJid: 'TEST-GROUP',
+    messageId: `TEST-${Date.now()}`,
+    senderJid: 'TEST-SENDER',
+    receivedAt: now.toISOString(),
+    timezone: TZ,
+    name: 'TEST USER',
+    type: 'ENTRY',
+    time: '10:12',
+    displayTime: '10:12 AM',
+    rawMessage: 'TEST USER Entry Time 10.12am'
+  };
+
+  await postAttendance(testEvent);
+  return testEvent;
+}
+
 async function findGroup(sock, force = false) {
   if (cachedGroup && !force) return cachedGroup;
 
@@ -170,6 +192,46 @@ const server = http.createServer(async (req, res) => {
         qrAvailable: Boolean(currentQr),
         qrUpdatedAt,
         startedAt
+      }));
+      return;
+    }
+
+
+    if (url.pathname === '/test-google') {
+      if (!authorized(req)) {
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(401);
+        res.end(JSON.stringify({
+          ok: false,
+          error: 'Unauthorized. Add ?token=YOUR_QR_TOKEN'
+        }));
+        return;
+      }
+
+      const testEvent = await sendTestAttendance();
+
+      res.setHeader('Content-Type', 'application/json');
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        ok: true,
+        message: 'Test attendance sent to Google Apps Script',
+        event: testEvent
+      }));
+      return;
+    }
+
+    if (url.pathname === '/debug') {
+      res.setHeader('Content-Type', 'application/json');
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        ok: true,
+        whatsapp: connected ? 'connected' : 'not_connected',
+        groupName: GROUP_NAME,
+        groupFound,
+        qrAvailable: Boolean(currentQr),
+        webhookConfigured: Boolean(WEBHOOK),
+        qrTokenConfigured: Boolean(QR_TOKEN),
+        uptimeSeconds: Math.floor(process.uptime())
       }));
       return;
     }
@@ -340,6 +402,7 @@ async function startWhatsApp() {
         const parsed = parseAttendance(text);
         if (!parsed) continue;
 
+        logger.info({ group: GROUP_NAME, text, parsed }, 'Attendance message matched; sending to Google');
         await postAttendance({
           event: 'attendance',
           groupName: GROUP_NAME,
