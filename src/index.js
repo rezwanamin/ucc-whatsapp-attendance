@@ -7,44 +7,46 @@ import makeWASocket, {
   makeCacheableSignalKeyStore
 } from '@whiskeysockets/baileys';
 import P from 'pino';
-import qrcode from 'qrcode-terminal';
+import QRCode from 'qrcode';
+import qrcodeTerminal from 'qrcode-terminal';
 
 const PORT = Number(process.env.PORT || 8080);
 const GROUP_NAME = process.env.ATTENDANCE_GROUP_NAME || 'Problem Group';
 const WEBHOOK = process.env.GOOGLE_APPS_SCRIPT_URL;
 const TZ = process.env.TZ || 'Asia/Dhaka';
+const QR_TOKEN = process.env.QR_TOKEN;
 
 if (!WEBHOOK) {
-  console.error('Missing GOOGLE_APPS_SCRIPT_URL environment variable.');
+  console.error('ERROR: Missing GOOGLE_APPS_SCRIPT_URL environment variable.');
   process.exit(1);
 }
 
-let connected = false;
-
-const server = http.createServer((req, res) => {
-  res.setHeader('Content-Type', 'application/json');
-  if (req.url === '/' || req.url === '/health') {
-    res.writeHead(200);
-    res.end(JSON.stringify({
-      ok: true,
-      service: 'WhatsApp Attendance',
-      whatsapp: connected ? 'connected' : 'starting'
-    }));
-    return;
-  }
-  res.writeHead(404);
-  res.end(JSON.stringify({ ok: false, error: 'Not found' }));
-});
-
-server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Health server listening on port ${PORT}`);
-});
+if (!QR_TOKEN) {
+  console.error('ERROR: Missing QR_TOKEN environment variable.');
+  process.exit(1);
+}
 
 const logger = P({ level: process.env.LOG_LEVEL || 'info' });
+
+let connected = false;
+let currentQr = null;
+let qrUpdatedAt = null;
 let cachedGroup = null;
+let groupFound = false;
 let reconnectTimer = null;
+let startedAt = new Date().toISOString();
 
 const normalizeText = (s = '') => s.replace(/\s+/g, ' ').trim();
+
+function safeEqual(a, b) {
+  return typeof a === 'string' && typeof b === 'string' && a.length === b.length && a === b;
+}
+
+function authorized(req) {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const token = url.searchParams.get('token') || req.headers['x-qr-token'];
+  return safeEqual(token, QR_TOKEN);
+}
 
 function parseAttendance(text) {
   const t = normalizeText(text);
@@ -77,34 +79,184 @@ async function postAttendance(event) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(event)
   });
+
   const body = await response.text();
-  if (!response.ok) throw new Error(`Google webhook ${response.status}: ${body.slice(0, 500)}`);
+
+  if (!response.ok) {
+    throw new Error(`Google webhook ${response.status}: ${body.slice(0, 500)}`);
+  }
+
   logger.info({ response: body }, 'Attendance sent to Google Sheets');
 }
 
 async function findGroup(sock, force = false) {
   if (cachedGroup && !force) return cachedGroup;
+
+  logger.info({ GROUP_NAME }, 'Searching WhatsApp groups...');
+
   const groups = await sock.groupFetchAllParticipating();
+
   const found = Object.entries(groups).find(([, g]) =>
     normalizeText(g.subject).toLowerCase() === GROUP_NAME.toLowerCase()
   );
+
   if (!found) {
     cachedGroup = null;
+    groupFound = false;
+    logger.warn({ GROUP_NAME }, 'Target WhatsApp group not found');
     return null;
   }
-  cachedGroup = { jid: found[0], subject: found[1].subject };
+
+  cachedGroup = {
+    jid: found[0],
+    subject: found[1].subject
+  };
+
+  groupFound = true;
+  logger.info(cachedGroup, 'Target WhatsApp group found');
+
   return cachedGroup;
 }
 
+function htmlPage(title, body) {
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>
+body{font-family:Arial,sans-serif;background:#f5f7fa;margin:0;padding:30px;text-align:center}
+.card{max-width:520px;margin:auto;background:#fff;border-radius:16px;padding:25px;box-shadow:0 5px 25px rgba(0,0,0,.08)}
+h1{font-size:24px;margin-top:0}
+img{max-width:100%;height:auto;border:10px solid #fff}
+.muted{color:#666}
+.ok{color:#16803c;font-weight:700}
+.warn{color:#b36b00;font-weight:700}
+.err{color:#c62828;font-weight:700}
+code{background:#f0f0f0;padding:3px 6px;border-radius:5px}
+</style>
+</head>
+<body><div class="card">${body}</div></body>
+</html>`;
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (url.pathname === '/' || url.pathname === '/health') {
+      res.setHeader('Content-Type', 'application/json');
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        ok: true,
+        service: 'WhatsApp Attendance',
+        whatsapp: connected ? 'connected' : 'starting',
+        groupFound
+      }));
+      return;
+    }
+
+    if (url.pathname === '/status') {
+      res.setHeader('Content-Type', 'application/json');
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        ok: true,
+        whatsapp: connected ? 'connected' : 'not_connected',
+        groupName: GROUP_NAME,
+        groupFound,
+        qrAvailable: Boolean(currentQr),
+        qrUpdatedAt,
+        startedAt
+      }));
+      return;
+    }
+
+    if (url.pathname === '/qr') {
+      if (!authorized(req)) {
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(401);
+        res.end(JSON.stringify({
+          ok: false,
+          error: 'Unauthorized. Add ?token=YOUR_QR_TOKEN'
+        }));
+        return;
+      }
+
+      if (connected) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.writeHead(200);
+        res.end(htmlPage('WhatsApp Connected', `
+          <h1>✅ WhatsApp Connected</h1>
+          <p class="ok">The WhatsApp account is already linked.</p>
+          <p>Group: <code>${GROUP_NAME}</code></p>
+          <p class="muted">You can close this page.</p>
+        `));
+        return;
+      }
+
+      if (!currentQr) {
+        res.setHeader('Content-Type', 'text/html; charset=utf-8');
+        res.writeHead(200);
+        res.end(htmlPage('WhatsApp QR', `
+          <h1>⏳ QR Not Ready</h1>
+          <p class="muted">WhatsApp is starting. Refresh this page after a few seconds.</p>
+          <script>setTimeout(()=>location.reload(),5000)</script>
+        `));
+        return;
+      }
+
+      const dataUrl = await QRCode.toDataURL(currentQr, {
+        width: 420,
+        margin: 2,
+        errorCorrectionLevel: 'M'
+      });
+
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      res.writeHead(200);
+      res.end(htmlPage('Scan WhatsApp QR', `
+        <h1>📱 Scan this QR</h1>
+        <p>WhatsApp → <b>Linked devices</b> → <b>Link a device</b></p>
+        <img src="${dataUrl}" alt="WhatsApp QR Code">
+        <p class="muted">This page refreshes every 10 seconds.</p>
+        <script>setTimeout(()=>location.reload(),10000)</script>
+      `));
+      return;
+    }
+
+    res.setHeader('Content-Type', 'application/json');
+    res.writeHead(404);
+    res.end(JSON.stringify({ ok: false, error: 'Not found' }));
+  } catch (err) {
+    logger.error({ err }, 'HTTP request failed');
+    res.writeHead(500);
+    res.end(JSON.stringify({ ok: false, error: 'Internal server error' }));
+  }
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  logger.info({ PORT }, 'Health/QR server listening');
+});
+
 async function startWhatsApp() {
+  logger.info('Starting WhatsApp initialization...');
+
   const { state, saveCreds } = await useMultiFileAuthState('./auth_info');
+  logger.info('Auth state initialized');
 
   let version;
   try {
+    logger.info('Fetching latest Baileys WhatsApp version...');
     ({ version } = await fetchLatestBaileysVersion());
-  } catch {
+    logger.info({ version }, 'Baileys version loaded');
+  } catch (err) {
+    logger.warn({ err }, 'Could not fetch latest Baileys version; using library default');
     version = undefined;
   }
+
+  logger.info('Creating WhatsApp socket...');
 
   const sock = makeWASocket({
     ...(version ? { version } : {}),
@@ -118,32 +270,52 @@ async function startWhatsApp() {
     syncFullHistory: false
   });
 
+  logger.info('WhatsApp socket created');
+
   sock.ev.on('creds.update', saveCreds);
 
   sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
-      console.log('\n===== WHATSAPP QR =====\n');
-      qrcode.generate(qr, { small: true });
-      console.log('\nScan from WhatsApp → Linked devices.\n');
+      currentQr = qr;
+      qrUpdatedAt = new Date().toISOString();
+
+      console.log('\n===== WHATSAPP QR (terminal fallback) =====\n');
+      qrcodeTerminal.generate(qr, { small: true });
+      console.log('\nOpen /qr?token=YOUR_QR_TOKEN in your browser to scan.\n');
+
+      logger.info('New WhatsApp QR generated');
     }
 
     if (connection === 'open') {
       connected = true;
-      const group = await findGroup(sock, true);
-      if (group) logger.info(group, 'Target WhatsApp group found');
-      else logger.warn({ GROUP_NAME }, 'Target WhatsApp group not found');
+      currentQr = null;
+      qrUpdatedAt = null;
+
+      logger.info('WhatsApp connection OPEN');
+
+      try {
+        await findGroup(sock, true);
+      } catch (err) {
+        groupFound = false;
+        logger.error({ err }, 'Could not search WhatsApp groups');
+      }
     }
 
     if (connection === 'close') {
       connected = false;
+      groupFound = false;
+
       const code = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = code !== DisconnectReason.loggedOut;
+
       logger.warn({ code, shouldReconnect }, 'WhatsApp connection closed');
 
       if (shouldReconnect && !reconnectTimer) {
         reconnectTimer = setTimeout(() => {
           reconnectTimer = null;
-          startWhatsApp().catch(err => logger.error({ err }, 'WhatsApp restart failed'));
+          startWhatsApp().catch(err =>
+            logger.error({ err }, 'WhatsApp restart failed')
+          );
         }, 5000);
       }
     }
