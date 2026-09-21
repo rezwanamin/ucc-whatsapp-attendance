@@ -1,11 +1,10 @@
-# UCC WhatsApp Attendance V5
+# UCC WhatsApp Attendance V6
 
-Adds browser diagnostics for incoming WhatsApp group messages.
+Attendance processing rule:
+- Process any message from the configured `Problem Group`, regardless of sender/fromMe.
+- Ignore non-attendance text.
+- Parse Entry/Left time and send valid attendance to Google Apps Script.
 
-Routes:
-- `/health`
-- `/status`
-- `/debug`
-- `/messages?token=YOUR_QR_TOKEN` — last 30 incoming group-message events
-- `/qr?token=YOUR_QR_TOKEN`
-- `/test-google?token=YOUR_QR_TOKEN`
+Important:
+- Do not commit `.env` or `auth_info`.
+- Existing QR/session behavior is unchanged in this version.
