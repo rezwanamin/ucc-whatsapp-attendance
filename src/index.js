@@ -48,6 +48,50 @@ function authorized(req) {
   return safeEqual(token, QR_TOKEN);
 }
 
+
+const recentMessages = [];
+const MAX_RECENT_MESSAGES = 50;
+
+function rememberMessage(item) {
+  recentMessages.unshift({
+    ...item,
+    at: new Date().toISOString()
+  });
+  if (recentMessages.length > MAX_RECENT_MESSAGES) {
+    recentMessages.length = MAX_RECENT_MESSAGES;
+  }
+}
+
+function extractMessageText(message) {
+  if (!message) return '';
+
+  const direct =
+    message.conversation ||
+    message.extendedTextMessage?.text ||
+    message.imageMessage?.caption ||
+    message.videoMessage?.caption ||
+    message.documentMessage?.caption;
+
+  if (direct) return direct;
+
+  // Common WhatsApp wrapper messages.
+  const wrappers = [
+    message.ephemeralMessage?.message,
+    message.viewOnceMessage?.message,
+    message.viewOnceMessageV2?.message,
+    message.viewOnceMessageV2Extension?.message,
+    message.documentWithCaptionMessage?.message,
+    message.editedMessage?.message
+  ];
+
+  for (const inner of wrappers) {
+    const text = extractMessageText(inner);
+    if (text) return text;
+  }
+
+  return '';
+}
+
 function parseAttendance(text) {
   const t = normalizeText(text);
 
@@ -184,6 +228,7 @@ const server = http.createServer(async (req, res) => {
       res.end(JSON.stringify({
         ok: true,
         service: 'WhatsApp Attendance',
+        version: '1.6.0',
         whatsapp: connected ? 'connected' : 'starting',
         groupFound
       }));
@@ -195,6 +240,7 @@ const server = http.createServer(async (req, res) => {
       res.writeHead(200);
       res.end(JSON.stringify({
         ok: true,
+        version: '1.6.0',
         whatsapp: connected ? 'connected' : 'not_connected',
         groupName: GROUP_NAME,
         groupFound,
@@ -205,6 +251,40 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+
+
+    if (url.pathname === '/messages') {
+      if (!authorized(req)) {
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(401);
+        res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+        return;
+      }
+
+      res.setHeader('Content-Type', 'application/json');
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        ok: true,
+        count: recentMessages.length,
+        messages: recentMessages
+      }));
+      return;
+    }
+
+    if (url.pathname === '/messages/clear') {
+      if (!authorized(req)) {
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(401);
+        res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
+        return;
+      }
+
+      recentMessages.length = 0;
+      res.setHeader('Content-Type', 'application/json');
+      res.writeHead(200);
+      res.end(JSON.stringify({ ok: true, message: 'Diagnostic messages cleared' }));
+      return;
+    }
 
     if (url.pathname === '/test-google') {
       if (!authorized(req)) {
@@ -392,23 +472,50 @@ async function startWhatsApp() {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    for (const msg of messages) {
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    logger.info({
+      event: 'messages.upsert',
+      upsertType: type || '',
+      count: Array.isArray(messages) ? messages.length : 0
+    }, 'WhatsApp messages.upsert received');
+
+    for (const msg of messages || []) {
       try {
-        if (!msg.message || msg.key.fromMe) continue;
+        if (!msg?.key) continue;
 
-        const remoteJid = msg.key.remoteJid;
-        if (!remoteJid?.endsWith('@g.us')) continue;
+        const remoteJid = msg.key.remoteJid || '';
+        const participant = msg.key.participant || '';
+        const fromMe = Boolean(msg.key.fromMe);
+        const text = extractMessageText(msg.message);
 
-        const group = await findGroup(sock);
-        if (!group || remoteJid !== group.jid) continue;
+        const isGroup = remoteJid.endsWith('@g.us');
+        const groupMatched = Boolean(
+          isGroup &&
+          cachedGroup &&
+          remoteJid === cachedGroup.jid
+        );
 
-        const text =
-          msg.message.conversation ||
-          msg.message.extendedTextMessage?.text ||
-          '';
+        const parsed = text ? parseAttendance(text) : null;
 
-        const parsed = parseAttendance(text);
+        if (isGroup) {
+          rememberMessage({
+            upsertType: type || '',
+            messageId: msg.key.id || '',
+            remoteJid,
+            participant,
+            fromMe,
+            groupName: GROUP_NAME,
+            groupMatched,
+            text,
+            parsed
+          });
+        }
+
+        // Only the configured group is processed.
+        if (!isGroup || !groupMatched || !msg.message) continue;
+
+        // Sender identity is intentionally NOT used as a filter.
+        if (!text) continue;
         if (!parsed) continue;
 
         logger.info({
@@ -418,16 +525,47 @@ async function startWhatsApp() {
           text,
           parsed
         }, 'Attendance message matched; sending to Google');
-        await postAttendance({
-          event: 'attendance',
-          groupName: GROUP_NAME,
-          groupJid: remoteJid,
-          messageId: msg.key.id || '',
-          senderJid: msg.key.participant || msg.key.remoteJid || '',
-          receivedAt: new Date().toISOString(),
-          timezone: TZ,
-          ...parsed
-        });
+
+        try {
+          await postAttendance({
+            event: 'attendance',
+            groupName: GROUP_NAME,
+            groupJid: remoteJid,
+            messageId: msg.key.id || '',
+            senderJid: participant || remoteJid,
+            receivedAt: new Date().toISOString(),
+            timezone: TZ,
+            ...parsed
+          });
+
+          rememberMessage({
+            upsertType: type || '',
+            messageId: msg.key.id || '',
+            remoteJid,
+            participant,
+            fromMe,
+            groupName: GROUP_NAME,
+            groupMatched: true,
+            text,
+            parsed,
+            googlePost: 'success'
+          });
+        } catch (err) {
+          rememberMessage({
+            upsertType: type || '',
+            messageId: msg.key.id || '',
+            remoteJid,
+            participant,
+            fromMe,
+            groupName: GROUP_NAME,
+            groupMatched: true,
+            text,
+            parsed,
+            googlePost: 'failed',
+            googleError: String(err?.message || err)
+          });
+          throw err;
+        }
       } catch (err) {
         logger.error({ err }, 'Failed to process WhatsApp message');
       }
