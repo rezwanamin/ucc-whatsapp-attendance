@@ -35,12 +35,6 @@ let cachedGroup = null;
 let groupFound = false;
 let reconnectTimer = null;
 let startedAt = new Date().toISOString();
-const recentMessages = [];
-
-function rememberMessage(item) {
-  recentMessages.unshift({ ...item, at: new Date().toISOString() });
-  if (recentMessages.length > 30) recentMessages.pop();
-}
 
 const normalizeText = (s = '') => s.replace(/\s+/g, ' ').trim();
 
@@ -56,7 +50,16 @@ function authorized(req) {
 
 function parseAttendance(text) {
   const t = normalizeText(text);
-  const m = t.match(/^(.+?)\s+(entry(?:\s*time)?|left(?:\s*time)?)\s*[:\-]?\s*(\d{1,2})[.:](\d{2})\s*(am|pm)$/i);
+
+  // Accepted examples:
+  // Maidul Entry Time 6.00am
+  // Maidul Entry 6:00 AM
+  // Maidul Left time 6.00pm
+  // Maidul LEFT 6:00 PM
+  const m = t.match(
+    /^(.+?)\s+(entry(?:\s*time)?|left(?:\s*time)?)\s*[:\-]?\s*(\d{1,2})[.:](\d{2})\s*(am|pm)$/i
+  );
+
   if (!m) return null;
 
   const name = m[1].trim().replace(/\s*[-:]\s*$/, '');
@@ -65,7 +68,7 @@ function parseAttendance(text) {
   const minute = Number(m[4]);
   const ampm = m[5].toUpperCase();
 
-  if (hour < 1 || hour > 12 || minute > 59) return null;
+  if (!name || hour < 1 || hour > 12 || minute > 59) return null;
 
   let h24 = hour % 12;
   if (ampm === 'PM') h24 += 12;
@@ -202,25 +205,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-
-
-    if (url.pathname === '/messages') {
-      if (!authorized(req)) {
-        res.setHeader('Content-Type', 'application/json');
-        res.writeHead(401);
-        res.end(JSON.stringify({ ok: false, error: 'Unauthorized' }));
-        return;
-      }
-
-      res.setHeader('Content-Type', 'application/json');
-      res.writeHead(200);
-      res.end(JSON.stringify({
-        ok: true,
-        count: recentMessages.length,
-        messages: recentMessages
-      }));
-      return;
-    }
 
     if (url.pathname === '/test-google') {
       if (!authorized(req)) {
@@ -408,65 +392,44 @@ async function startWhatsApp() {
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const msg of messages) {
       try {
-        if (!msg?.key) continue;
+        if (!msg.message || msg.key.fromMe) continue;
 
-        const remoteJid = msg.key.remoteJid || '';
-        const participant = msg.key.participant || '';
-        const fromMe = Boolean(msg.key.fromMe);
-
-        const text =
-          msg.message?.conversation ||
-          msg.message?.extendedTextMessage?.text ||
-          msg.message?.ephemeralMessage?.message?.conversation ||
-          msg.message?.ephemeralMessage?.message?.extendedTextMessage?.text ||
-          msg.message?.viewOnceMessage?.message?.conversation ||
-          msg.message?.viewOnceMessage?.message?.extendedTextMessage?.text ||
-          '';
-
-        // Record incoming group messages so we can diagnose from the browser
-        // even when the hosting provider does not show runtime stdout logs.
-        if (remoteJid.endsWith('@g.us')) {
-          rememberMessage({
-            upsertType: type || '',
-            remoteJid,
-            participant,
-            fromMe,
-            text: text || '',
-            groupMatched: Boolean(cachedGroup && remoteJid === cachedGroup.jid),
-            parsed: text ? parseAttendance(text) : null
-          });
-        }
-
-        if (!msg.message || fromMe) continue;
-        if (!remoteJid.endsWith('@g.us')) continue;
+        const remoteJid = msg.key.remoteJid;
+        if (!remoteJid?.endsWith('@g.us')) continue;
 
         const group = await findGroup(sock);
         if (!group || remoteJid !== group.jid) continue;
-        if (!text) continue;
+
+        const text =
+          msg.message.conversation ||
+          msg.message.extendedTextMessage?.text ||
+          '';
 
         const parsed = parseAttendance(text);
         if (!parsed) continue;
 
-        logger.info({ group: GROUP_NAME, text, parsed }, 'Attendance message matched; sending to Google');
-
+        logger.info({
+          group: GROUP_NAME,
+          fromMe,
+          participant,
+          text,
+          parsed
+        }, 'Attendance message matched; sending to Google');
         await postAttendance({
           event: 'attendance',
           groupName: GROUP_NAME,
           groupJid: remoteJid,
           messageId: msg.key.id || '',
-          senderJid: participant || remoteJid,
+          senderJid: msg.key.participant || msg.key.remoteJid || '',
           receivedAt: new Date().toISOString(),
           timezone: TZ,
           ...parsed
         });
       } catch (err) {
         logger.error({ err }, 'Failed to process WhatsApp message');
-        rememberMessage({
-          error: String(err?.message || err)
-        });
       }
     }
   });
